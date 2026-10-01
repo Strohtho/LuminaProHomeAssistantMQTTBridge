@@ -26,6 +26,9 @@ if ! command -v apt-get >/dev/null 2>&1; then
     exit 1
 fi
 
+# Configure git safe.directory to avoid dubious ownership warnings
+git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3 python3-venv python3-pip git curl

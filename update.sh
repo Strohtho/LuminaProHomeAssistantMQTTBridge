@@ -19,6 +19,9 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# Configure git safe.directory to avoid dubious ownership warnings
+git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
+
 # 1. Git pull while protecting local config.json
 if [ -d ".git" ]; then
     echo "[*] Pulling latest updates from GitHub..."
