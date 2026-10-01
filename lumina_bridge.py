@@ -750,7 +750,7 @@ class WindowActuator:
             new_state = "closed" if is_closed else "open"
             if new_state != self.state:
                 self.state = new_state
-                self.publish(f"lumina/cover/{self.key}/state", self.state)
+                self.publish(f"{self.lumina.cfg.get('base_topic', 'lumina')}/cover/{self.key}/state", self.state, retain=True)
 
     async def handle_command(self, cmd: str):
         cmd = cmd.strip().upper()
@@ -775,7 +775,8 @@ class WindowActuator:
         # Pulse target open relay ON
         await self.lumina.send_command(CMD_UNIT_ON, 0, self.open_unit)
         self.state = "opening"
-        self.publish(f"lumina/cover/{self.key}/state", self.state)
+        base_topic = self.lumina.cfg.get("base_topic", "lumina")
+        self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
 
         self._motion_task = asyncio.create_task(self._runtime_watcher("open", self.open_unit))
 
@@ -792,7 +793,8 @@ class WindowActuator:
         # Pulse target close relay ON
         await self.lumina.send_command(CMD_UNIT_ON, 0, self.close_unit)
         self.state = "closing"
-        self.publish(f"lumina/cover/{self.key}/state", self.state)
+        base_topic = self.lumina.cfg.get("base_topic", "lumina")
+        self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
 
         self._motion_task = asyncio.create_task(self._runtime_watcher("closed", self.close_unit))
 
@@ -803,13 +805,15 @@ class WindowActuator:
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.open_unit)
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.close_unit)
         self.state = "stopped"
-        self.publish(f"lumina/cover/{self.key}/state", self.state)
+        base_topic = self.lumina.cfg.get("base_topic", "lumina")
+        self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
 
     async def _finish_stop(self, final_state: str):
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.open_unit)
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.close_unit)
         self.state = final_state
-        self.publish(f"lumina/cover/{self.key}/state", self.state)
+        base_topic = self.lumina.cfg.get("base_topic", "lumina")
+        self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
 
     async def _runtime_watcher(self, final_state: str, active_unit: int):
         try:
@@ -817,7 +821,8 @@ class WindowActuator:
             self.logger.info("%s runtime (%ds) elapsed; turning off relay %d", self.name, int(self.runtime), active_unit)
             await self.lumina.send_command(CMD_UNIT_OFF, 0, active_unit)
             self.state = final_state
-            self.publish(f"lumina/cover/{self.key}/state", self.state)
+            base_topic = self.lumina.cfg.get("base_topic", "lumina")
+            self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
         except asyncio.CancelledError:
             await self.lumina.send_command(CMD_UNIT_OFF, 0, active_unit)
 
@@ -866,29 +871,33 @@ class LuminaMqttBridge:
     def _on_lumina_status(self, entity_type: str, obj_num: int, data: dict):
         """Dispatches status updates from Lumina controller to MQTT."""
         if entity_type == "zone":
-            # Check sensors
+            # Check configured environmental & motion sensors
             for s_key, scfg in self.sensors.items():
                 if int(scfg["zone"]) == obj_num:
                     stype = scfg.get("type", "")
                     loop_val = data.get("loop", 0)
                     status_byte = data.get("status", 0)
 
-                    if stype == "temperature_er":
-                        # Raw loop conversion formula to Fahrenheit: Temp_F = -40.0 + (0.5 * loop_val)
-                        temp_f = -40.0 + (0.5 * loop_val)
-                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/temperature", f"{temp_f:.1f}")
+                    if stype in ("temperature_er", "temperature"):
+                        # Only publish if loop_val > 0 to avoid spurious -40°F on startup
+                        if loop_val > 0:
+                            temp_f = -40.0 + (0.5 * loop_val)
+                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/temperature", f"{temp_f:.1f}", retain=True)
                     elif stype == "humidity":
-                        # Humidity: raw loop value = percentage 0-100%
-                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/humidity", str(loop_val))
-                    elif stype == "motion":
-                        # Motion: Bit 0 of status byte = tripped/not ready
+                        if loop_val > 0:
+                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/humidity", str(loop_val), retain=True)
+                    elif stype in ("motion", "contact", "window", "door"):
+                        # Tripped: Bit 0 of status byte = 1 (tripped/not ready)
                         tripped = (status_byte & 0x01) != 0
-                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", "ON" if tripped else "OFF")
+                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", "ON" if tripped else "OFF", retain=True)
 
-            # Check window contacts
-            for w in self.windows.values():
+            # Check window contacts (covers & contact binary sensors)
+            for w_key, w in self.windows.items():
                 if w.contact_zone == obj_num:
-                    w.update_contact(data.get("status", 0))
+                    status_byte = data.get("status", 0)
+                    w.update_contact(status_byte)
+                    is_open = (status_byte & 0x01) != 0
+                    self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", "ON" if is_open else "OFF", retain=True)
 
         elif entity_type == "audio":
             zone_id_str = str(obj_num)
@@ -898,12 +907,17 @@ class LuminaMqttBridge:
                 volume = data.get("volume", 0)
                 mute = data.get("mute", False)
 
-                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/power/state", "ON" if power else "OFF")
-                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/volume/state", str(volume))
-                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/mute/state", "ON" if mute else "OFF")
+                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/power/state", "ON" if power else "OFF", retain=True)
+                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/volume/state", str(volume), retain=True)
+                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/mute/state", "ON" if mute else "OFF", retain=True)
 
                 src_name = self.source_id_to_name.get(source_id, f"Source {source_id}")
-                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/source/state", src_name)
+                self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/source/state", src_name, retain=True)
+
+    def publish_current_states(self):
+        """Re-publishes known states of covers to MQTT with retention."""
+        for w_key, w in self.windows.items():
+            self.publish_mqtt(f"{self.base_topic}/cover/{w_key}/state", w.state, retain=True)
 
     def _setup_mqtt(self):
         import paho.mqtt.client as mqtt
@@ -928,6 +942,7 @@ class LuminaMqttBridge:
                 self.publish_mqtt(self.avail_topic, "online", retain=True)
                 self.publish_discovery()
                 self._subscribe_topics()
+                self.publish_current_states()
             else:
                 self.logger.error("Failed to connect to MQTT broker, return code %d", rc)
 
@@ -944,6 +959,10 @@ class LuminaMqttBridge:
         self.mqtt_client.loop_start()
 
     def _subscribe_topics(self):
+        # Home Assistant Birth Message (online notification)
+        ha_status_topic = f"{self.disc_prefix}/status"
+        self.mqtt_client.subscribe(ha_status_topic, qos=1)
+
         # Subscribe to cover command topics
         for w_key in self.windows.keys():
             t = f"{self.base_topic}/cover/{w_key}/set"
@@ -958,6 +977,18 @@ class LuminaMqttBridge:
 
     async def _handle_mqtt_message(self, topic: str, payload: str):
         payload = payload.strip()
+
+        # Handle Home Assistant birth message
+        if topic == f"{self.disc_prefix}/status":
+            if payload.lower() == "online":
+                self.logger.info("Home Assistant online notification received; republishing discovery and state...")
+                self.publish_discovery()
+                self.publish_mqtt(self.avail_topic, "online", retain=True)
+                self.publish_current_states()
+                if self.lumina.is_connected:
+                    asyncio.create_task(self.lumina.request_initial_statuses())
+            return
+
         parts = topic.split("/")
 
         # Cover command: lumina/cover/{key}/set
@@ -972,21 +1003,39 @@ class LuminaMqttBridge:
             param = parts[3]
 
             if param == "power":
-                val = AUDIO_STATUS_ON if payload.upper() == "ON" else AUDIO_STATUS_OFF
+                is_on = payload.upper() == "ON"
+                val = AUDIO_STATUS_ON if is_on else AUDIO_STATUS_OFF
+                # Immediate optimistic state feedback
+                self.publish_mqtt(f"{self.base_topic}/audio/{zone_id}/power/state", "ON" if is_on else "OFF", retain=True)
                 await self.lumina.send_command(CMD_AUDIO_ZONE, val, zone_id)
+                await asyncio.sleep(0.2)
+                await self.lumina.request_status(OBJ_AUDIO_ZONE, zone_id, zone_id)
             elif param == "mute":
-                val = AUDIO_STATUS_MUTE_ON if payload.upper() == "ON" else AUDIO_STATUS_MUTE_OFF
+                is_mute = payload.upper() == "ON"
+                val = AUDIO_STATUS_MUTE_ON if is_mute else AUDIO_STATUS_MUTE_OFF
+                # Immediate optimistic state feedback
+                self.publish_mqtt(f"{self.base_topic}/audio/{zone_id}/mute/state", "ON" if is_mute else "OFF", retain=True)
                 await self.lumina.send_command(CMD_AUDIO_ZONE, val, zone_id)
+                await asyncio.sleep(0.2)
+                await self.lumina.request_status(OBJ_AUDIO_ZONE, zone_id, zone_id)
             elif param == "volume":
                 try:
                     vol = max(0, min(100, int(float(payload))))
+                    # Immediate optimistic state feedback
+                    self.publish_mqtt(f"{self.base_topic}/audio/{zone_id}/volume/state", str(vol), retain=True)
                     await self.lumina.send_command(CMD_AUDIO_VOLUME, vol, zone_id)
+                    await asyncio.sleep(0.2)
+                    await self.lumina.request_status(OBJ_AUDIO_ZONE, zone_id, zone_id)
                 except ValueError:
                     self.logger.warning("Invalid volume payload: %s", payload)
             elif param == "source":
                 src_id = self.source_name_to_id.get(payload)
                 if src_id is not None:
+                    # Immediate optimistic state feedback
+                    self.publish_mqtt(f"{self.base_topic}/audio/{zone_id}/source/state", payload, retain=True)
                     await self.lumina.send_command(CMD_AUDIO_SOURCE, src_id, zone_id)
+                    await asyncio.sleep(0.2)
+                    await self.lumina.request_status(OBJ_AUDIO_ZONE, zone_id, zone_id)
                 else:
                     self.logger.warning("Unknown audio source name: %s", payload)
 
@@ -1008,11 +1057,11 @@ class LuminaMqttBridge:
             name = scfg.get("name", s_key)
             stype = scfg.get("type", "")
 
-            if stype == "temperature_er":
-                disc_topic = f"{self.disc_prefix}/sensor/lumina/temp_dining/config"
+            if stype in ("temperature_er", "temperature"):
+                disc_topic = f"{self.disc_prefix}/sensor/lumina/{s_key}/config"
                 payload = {
                     "name": name,
-                    "unique_id": f"lumina_zone_{zone}_temperature",
+                    "unique_id": f"lumina_zone_{zone}_{s_key}",
                     "state_topic": f"{self.base_topic}/zone/{zone}/temperature",
                     "unit_of_measurement": "°F",
                     "device_class": "temperature",
@@ -1023,10 +1072,10 @@ class LuminaMqttBridge:
                 self.publish_mqtt(disc_topic, json.dumps(payload), retain=True)
 
             elif stype == "humidity":
-                disc_topic = f"{self.disc_prefix}/sensor/lumina/hum_dining/config"
+                disc_topic = f"{self.disc_prefix}/sensor/lumina/{s_key}/config"
                 payload = {
                     "name": name,
-                    "unique_id": f"lumina_zone_{zone}_humidity",
+                    "unique_id": f"lumina_zone_{zone}_{s_key}",
                     "state_topic": f"{self.base_topic}/zone/{zone}/humidity",
                     "unit_of_measurement": "%",
                     "device_class": "humidity",
@@ -1036,21 +1085,22 @@ class LuminaMqttBridge:
                 }
                 self.publish_mqtt(disc_topic, json.dumps(payload), retain=True)
 
-            elif stype == "motion":
+            elif stype in ("motion", "contact", "window", "door"):
                 disc_topic = f"{self.disc_prefix}/binary_sensor/lumina/{s_key}/config"
+                dev_class = stype if stype in ("motion", "window", "door") else "opening"
                 payload = {
                     "name": name,
-                    "unique_id": f"lumina_zone_{zone}_motion",
+                    "unique_id": f"lumina_zone_{zone}_{s_key}",
                     "state_topic": f"{self.base_topic}/zone/{zone}/state",
                     "payload_on": "ON",
                     "payload_off": "OFF",
-                    "device_class": "motion",
+                    "device_class": dev_class,
                     "availability_topic": self.avail_topic,
                     "device": device_info
                 }
                 self.publish_mqtt(disc_topic, json.dumps(payload), retain=True)
 
-        # 2. Motorized Window Actuators (7 Covers)
+        # 2. Motorized Window Actuators (7 Covers) & Physical Contact Sensors
         for w_key, wcfg in self.config.get("windows", {}).items():
             name = wcfg.get("name", w_key)
             disc_topic = f"{self.disc_prefix}/cover/lumina/{w_key}/config"
@@ -1072,6 +1122,23 @@ class LuminaMqttBridge:
                 "device": device_info
             }
             self.publish_mqtt(disc_topic, json.dumps(payload), retain=True)
+
+            # Window Physical Contact Sensor
+            contact_zone = int(wcfg.get("contact_zone", 0))
+            if contact_zone > 0:
+                contact_disc_topic = f"{self.disc_prefix}/binary_sensor/lumina/{w_key}_contact/config"
+                contact_payload = {
+                    "name": f"{name} Contact",
+                    "unique_id": f"lumina_window_{w_key}_contact",
+                    "state_topic": f"{self.base_topic}/zone/{contact_zone}/state",
+                    "payload_on": "ON",
+                    "payload_off": "OFF",
+                    "device_class": "window",
+                    "availability_topic": self.avail_topic,
+                    "device": device_info
+                }
+                self.publish_mqtt(contact_disc_topic, json.dumps(contact_payload), retain=True)
+
 
         # 3. HAI Hi-Fi 2 Audio System (4 Zones)
         source_options = [self.source_id_to_name[i] for i in sorted(self.source_id_to_name.keys())]

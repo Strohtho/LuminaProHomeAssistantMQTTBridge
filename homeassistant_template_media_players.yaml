@@ -39,7 +39,8 @@
         target:
           entity_id: switch.living_audio_power
       mute_volume:
-        action: switch.turn_on
+        action: >-
+          switch.turn_{{ 'on' if is_volume_muted else 'off' }}
         target:
           entity_id: switch.living_audio_mute
       set_volume_level:
@@ -80,7 +81,8 @@
         target:
           entity_id: switch.dining_audio_power
       mute_volume:
-        action: switch.turn_on
+        action: >-
+          switch.turn_{{ 'on' if is_volume_muted else 'off' }}
         target:
           entity_id: switch.dining_audio_mute
       set_volume_level:
@@ -121,7 +123,8 @@
         target:
           entity_id: switch.bath_audio_power
       mute_volume:
-        action: switch.turn_on
+        action: >-
+          switch.turn_{{ 'on' if is_volume_muted else 'off' }}
         target:
           entity_id: switch.bath_audio_mute
       set_volume_level:
@@ -162,7 +165,8 @@
         target:
           entity_id: switch.bed_audio_power
       mute_volume:
-        action: switch.turn_on
+        action: >-
+          switch.turn_{{ 'on' if is_volume_muted else 'off' }}
         target:
           entity_id: switch.bed_audio_mute
       set_volume_level:
