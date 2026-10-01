@@ -1,0 +1,179 @@
+# ==============================================================================
+# Home Assistant Template Media Players for Leviton Lumina Pro / HAI Hi-Fi 2
+# ==============================================================================
+# This configuration combines the discrete MQTT switches, numbers, and selects
+# published by lumina_bridge into unified, standard Home Assistant media_player
+# entities for Lovelace cards, automation, and voice assistant (Alexa/Google) control.
+#
+# INCLUSION IN CONFIGURATION.YAML:
+# Option 1: If using 'media_player: !include homeassistant_template_media_players.yaml'
+#           Keep the top-level list format below as-is.
+# Option 2: If copying directly into configuration.yaml under an existing 'media_player:' key:
+#           Paste the content below indented under 'media_player:'.
+# ==============================================================================
+
+- platform: template
+  media_players:
+    living_audio:
+      friendly_name: "Living Audio"
+      unique_id: "lumina_media_player_living_audio"
+      value_template: >-
+        {{ states('switch.living_audio_power') }}
+      volume_level_template: >-
+        {{ (states('number.living_audio_volume') | float(0)) / 100.0 }}
+      is_volume_muted_template: >-
+        {{ is_state('switch.living_audio_mute', 'on') }}
+      source_template: >-
+        {{ states('select.living_audio_source') }}
+      source_list:
+        - "Living"
+        - "Office"
+        - "Bath"
+        - "Bed"
+      turn_on:
+        action: switch.turn_on
+        target:
+          entity_id: switch.living_audio_power
+      turn_off:
+        action: switch.turn_off
+        target:
+          entity_id: switch.living_audio_power
+      mute_volume:
+        action: switch.turn_on
+        target:
+          entity_id: switch.living_audio_mute
+      set_volume_level:
+        action: number.set_value
+        target:
+          entity_id: number.living_audio_volume
+        data:
+          value: "{{ (volume * 100) | int }}"
+      select_source:
+        action: select.select_option
+        target:
+          entity_id: select.living_audio_source
+        data:
+          option: "{{ source }}"
+
+    dining_audio:
+      friendly_name: "Dining Audio"
+      unique_id: "lumina_media_player_dining_audio"
+      value_template: >-
+        {{ states('switch.dining_audio_power') }}
+      volume_level_template: >-
+        {{ (states('number.dining_audio_volume') | float(0)) / 100.0 }}
+      is_volume_muted_template: >-
+        {{ is_state('switch.dining_audio_mute', 'on') }}
+      source_template: >-
+        {{ states('select.dining_audio_source') }}
+      source_list:
+        - "Living"
+        - "Office"
+        - "Bath"
+        - "Bed"
+      turn_on:
+        action: switch.turn_on
+        target:
+          entity_id: switch.dining_audio_power
+      turn_off:
+        action: switch.turn_off
+        target:
+          entity_id: switch.dining_audio_power
+      mute_volume:
+        action: switch.turn_on
+        target:
+          entity_id: switch.dining_audio_mute
+      set_volume_level:
+        action: number.set_value
+        target:
+          entity_id: number.dining_audio_volume
+        data:
+          value: "{{ (volume * 100) | int }}"
+      select_source:
+        action: select.select_option
+        target:
+          entity_id: select.dining_audio_source
+        data:
+          option: "{{ source }}"
+
+    bath_audio:
+      friendly_name: "Bath Audio"
+      unique_id: "lumina_media_player_bath_audio"
+      value_template: >-
+        {{ states('switch.bath_audio_power') }}
+      volume_level_template: >-
+        {{ (states('number.bath_audio_volume') | float(0)) / 100.0 }}
+      is_volume_muted_template: >-
+        {{ is_state('switch.bath_audio_mute', 'on') }}
+      source_template: >-
+        {{ states('select.bath_audio_source') }}
+      source_list:
+        - "Living"
+        - "Office"
+        - "Bath"
+        - "Bed"
+      turn_on:
+        action: switch.turn_on
+        target:
+          entity_id: switch.bath_audio_power
+      turn_off:
+        action: switch.turn_off
+        target:
+          entity_id: switch.bath_audio_power
+      mute_volume:
+        action: switch.turn_on
+        target:
+          entity_id: switch.bath_audio_mute
+      set_volume_level:
+        action: number.set_value
+        target:
+          entity_id: number.bath_audio_volume
+        data:
+          value: "{{ (volume * 100) | int }}"
+      select_source:
+        action: select.select_option
+        target:
+          entity_id: select.bath_audio_source
+        data:
+          option: "{{ source }}"
+
+    bed_audio:
+      friendly_name: "Bed Audio"
+      unique_id: "lumina_media_player_bed_audio"
+      value_template: >-
+        {{ states('switch.bed_audio_power') }}
+      volume_level_template: >-
+        {{ (states('number.bed_audio_volume') | float(0)) / 100.0 }}
+      is_volume_muted_template: >-
+        {{ is_state('switch.bed_audio_mute', 'on') }}
+      source_template: >-
+        {{ states('select.bed_audio_source') }}
+      source_list:
+        - "Living"
+        - "Office"
+        - "Bath"
+        - "Bed"
+      turn_on:
+        action: switch.turn_on
+        target:
+          entity_id: switch.bed_audio_power
+      turn_off:
+        action: switch.turn_off
+        target:
+          entity_id: switch.bed_audio_power
+      mute_volume:
+        action: switch.turn_on
+        target:
+          entity_id: switch.bed_audio_mute
+      set_volume_level:
+        action: number.set_value
+        target:
+          entity_id: number.bed_audio_volume
+        data:
+          value: "{{ (volume * 100) | int }}"
+      select_source:
+        action: select.select_option
+        target:
+          entity_id: select.bed_audio_source
+        data:
+          option: "{{ source }}"

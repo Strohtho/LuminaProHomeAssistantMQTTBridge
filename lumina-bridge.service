@@ -1,0 +1,31 @@
+[Unit]
+Description=Leviton Lumina Pro to MQTT Home Assistant Bridge
+Documentation=https://github.com/Strohtho/LuminaProHomeAssistantMQTTBridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lumina
+Group=lumina
+WorkingDirectory=/opt/lumina-bridge
+ExecStart=/opt/lumina-bridge/venv/bin/python /opt/lumina-bridge/lumina_bridge.py -c /opt/lumina-bridge/config.json
+Restart=always
+RestartSec=5s
+
+# Process Environment & Hardening
+Environment="PYTHONUNBUFFERED=1"
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+# Logging & Signals
+StandardOutput=journal
+StandardError=journal
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
