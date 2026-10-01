@@ -368,18 +368,18 @@ class LuminaController:
             return
 
         payload = data[4:]
-        # Unsolicited event packets from controller arrive with SequenceNumber == 0
-        if seq_num == 0:
-            if pkt_type == PKT_OMNILINK_MESSAGE and self._session_key:
-                msg = self._decrypt_omnilink_message(0, payload)
-                if msg:
-                    self._handle_omnilink_message(msg)
-            return
+        self.logger.debug("Received UDP datagram: seq=%d, type=0x%02X, len=%d", seq_num, pkt_type, len(data))
 
-        # Check for matching pending request
+        # Check for matching pending request (e.g. handshake requests)
         future = self._pending_requests.get(seq_num)
         if future and not future.done():
             future.set_result((pkt_type, payload))
+
+        # Always decrypt and process application message frames (OmniLink1 0x10 & OmniLink2 0x20)
+        if pkt_type in (PKT_OMNILINK_MESSAGE, 0x20) and self._session_key:
+            msg = self._decrypt_omnilink_message(seq_num, payload)
+            if msg:
+                self._handle_omnilink_message(msg)
 
     async def _establish_session(self) -> bool:
         async with self._handshake_lock:
@@ -488,6 +488,7 @@ class LuminaController:
         if not self._session_key or len(data) < 16 or len(data) % 16 != 0:
             return None
 
+        # 1. Try with packet sequence number masking (standard)
         dec = bytearray(aes_decrypt_ecb(self._session_key, data))
         seq_h = (seq >> 8) & 0xFF
         seq_l = seq & 0xFF
@@ -496,25 +497,29 @@ class LuminaController:
             dec[offset + 1] ^= seq_l
 
         # Frame structure: [StartChar, Length, Data..., CRC_Low, CRC_High, (Padding)]
-        if len(dec) < 4:
-            return None
-        start_char = dec[0]
-        if start_char not in (0x5A, 0x21):
-            return None
+        if len(dec) >= 4 and dec[0] in (0x5A, 0x21):
+            msg_len = dec[1]
+            if len(dec) >= 2 + msg_len + 2:
+                payload = bytes(dec[2 : 2 + msg_len])
+                crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
+                crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
+                if crc_recv == crc_calc:
+                    return payload
 
-        msg_len = dec[1]
-        if len(dec) < 2 + msg_len + 2:
-            return None
+        # 2. Fallback: If seq != 0 failed CRC, try unmasking with seq=0 (unmasked payload)
+        if seq != 0:
+            dec0 = bytearray(aes_decrypt_ecb(self._session_key, data))
+            if len(dec0) >= 4 and dec0[0] in (0x5A, 0x21):
+                msg_len0 = dec0[1]
+                if len(dec0) >= 2 + msg_len0 + 2:
+                    payload0 = bytes(dec0[2 : 2 + msg_len0])
+                    crc_recv0 = dec0[2 + msg_len0] | (dec0[2 + msg_len0 + 1] << 8)
+                    crc_calc0 = calculate_omnilink_crc16(bytes([msg_len0]) + payload0)
+                    if crc_recv0 == crc_calc0:
+                        return payload0
 
-        payload = bytes(dec[2 : 2 + msg_len])
-        crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
-        crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
-
-        if crc_recv != crc_calc:
-            self.logger.warning("OmniLink CRC mismatch: received 0x%04X, calculated 0x%04X", crc_recv, crc_calc)
-            return None
-
-        return payload
+        self.logger.debug("OmniLink frame decrypt failed or CRC mismatch (seq=%d)", seq)
+        return None
 
     async def send_message(self, payload: bytes, expect_reply: bool = True) -> Optional[bytes]:
         """Sends an encrypted OmniLink message with sequence matching and automatic retry."""
@@ -573,7 +578,12 @@ class LuminaController:
     async def request_status(self, obj_type: int, start_num: int, end_num: int):
         """Requests status report for a range of objects (Opcode 0x22)."""
         payload = struct.pack(">BBHH", MSG_REQUEST_STATUS, obj_type, start_num, end_num)
-        await self.send_message(payload, expect_reply=True)
+        await self.send_message(payload, expect_reply=False)
+
+    async def request_ext_status(self, obj_type: int, start_num: int, end_num: int):
+        """Requests extended status report for a range of objects (Opcode 0x3A)."""
+        payload = struct.pack(">BBHH", MSG_REQUEST_EXT_STATUS, obj_type, start_num, end_num)
+        await self.send_message(payload, expect_reply=False)
 
     async def send_command(self, cmd: int, param: int, target: int):
         """Dispatches direct command (Opcode 0x14 - clsOL2MsgCommand)."""
@@ -584,12 +594,18 @@ class LuminaController:
     async def request_initial_statuses(self):
         """Queries initial status for all active sensors, window contacts, and audio zones."""
         self.logger.info("Querying initial object statuses from controller...")
-        # Zones 1 to 16 (covers Temp 1, Hum 2, Motion 8, 9, 10)
+        # Zones 1 to 16 (Temp 1, Hum 2, Motion 8, 9, 10)
         await self.request_status(OBJ_ZONE, 1, 16)
-        # Zones 48 to 60 (covers Window contact sensors 49..55)
+        await asyncio.sleep(0.1)
+        await self.request_ext_status(OBJ_ZONE, 1, 16)
+        await asyncio.sleep(0.1)
+        # Zones 48 to 60 (Window contact sensors 49..55)
         await self.request_status(OBJ_ZONE, 48, 60)
-        # Audio Zones 1 to 4 (covers Living, Dining, Bath, Bed)
+        await asyncio.sleep(0.1)
+        # Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
         await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
+        await asyncio.sleep(0.1)
+        await self.request_ext_status(OBJ_AUDIO_ZONE, 1, 4)
 
     async def _watchdog_loop(self):
         """Periodic keep-alive watchdog matching clsOmniLinkConnection.WatchdogTimeout."""
@@ -608,7 +624,9 @@ class LuminaController:
             await asyncio.sleep(self.poll_interval)
             if self._online_secure:
                 await self.request_status(OBJ_ZONE, 1, 16)
+                await asyncio.sleep(0.1)
                 await self.request_status(OBJ_ZONE, 48, 60)
+                await asyncio.sleep(0.1)
                 await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
     def _handle_omnilink_message(self, msg: bytes):
@@ -626,7 +644,10 @@ class LuminaController:
         # System Events (0x37)
         elif msg_type == MSG_SYSTEM_EVENTS and len(msg) >= 3:
             event_code = (msg[1] << 8) | msg[2]
-            self.logger.debug("Received System Event notification: 0x%04X", event_code)
+            self.logger.info("Received System Event notification: 0x%04X", event_code)
+            asyncio.create_task(self.request_initial_statuses())
+        else:
+            self.logger.debug("Received OmniLink message type: 0x%02X", msg_type)
 
     def _parse_status_report(self, msg: bytes):
         """Unpacks standard status reports (clsOL2MsgStatus)."""
@@ -643,6 +664,7 @@ class LuminaController:
                 obj_num = (data[i] << 8) | data[i + 1]
                 status_byte = data[i + 2]
                 analog_loop = data[i + 3]
+                self.logger.info("Zone %d report: status=0x%02X, loop=%d", obj_num, status_byte, analog_loop)
                 if self.on_status_update:
                     self.on_status_update("zone", obj_num, {"status": status_byte, "loop": analog_loop})
 
@@ -656,6 +678,7 @@ class LuminaController:
                 source = data[i + 3]
                 volume = data[i + 4]
                 mute = data[i + 5] != 0
+                self.logger.info("Audio zone %d report: power=%s, vol=%d, src=%d, mute=%s", obj_num, power, volume, source, mute)
                 if self.on_status_update:
                     self.on_status_update("audio", obj_num, {
                         "power": power,
@@ -691,6 +714,7 @@ class LuminaController:
                 obj_num = (data[i] << 8) | data[i + 1]
                 status_byte = data[i + 2]
                 analog_loop = data[i + 3]
+                self.logger.info("Zone %d ext report: status=0x%02X, loop=%d", obj_num, status_byte, analog_loop)
                 if self.on_status_update:
                     self.on_status_update("zone", obj_num, {"status": status_byte, "loop": analog_loop})
 
@@ -703,6 +727,7 @@ class LuminaController:
                 source = data[i + 3]
                 volume = data[i + 4]
                 mute = data[i + 5] != 0
+                self.logger.info("Audio zone %d ext report: power=%s, vol=%d, src=%d, mute=%s", obj_num, power, volume, source, mute)
                 if self.on_status_update:
                     self.on_status_update("audio", obj_num, {
                         "power": power,
@@ -915,9 +940,29 @@ class LuminaMqttBridge:
                 self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/source/state", src_name, retain=True)
 
     def publish_current_states(self):
-        """Re-publishes known states of covers to MQTT with retention."""
+        """Re-publishes known states of all entities to MQTT with retention."""
+        self.logger.info("Publishing initial state snapshots for all entities...")
+
+        # 1. Covers & Window Physical Contacts
         for w_key, w in self.windows.items():
             self.publish_mqtt(f"{self.base_topic}/cover/{w_key}/state", w.state, retain=True)
+            if w.contact_zone > 0:
+                self.publish_mqtt(f"{self.base_topic}/zone/{w.contact_zone}/state", "OFF", retain=True)
+
+        # 2. Binary Motion & Environmental Sensors
+        for s_key, scfg in self.sensors.items():
+            zone = int(scfg["zone"])
+            stype = scfg.get("type", "")
+            if stype in ("motion", "contact", "window", "door"):
+                self.publish_mqtt(f"{self.base_topic}/zone/{zone}/state", "OFF", retain=True)
+
+        # 3. Audio Zones
+        first_src = self.source_id_to_name.get(1, "Source 1")
+        for z_id_str in self.audio_zones.keys():
+            self.publish_mqtt(f"{self.base_topic}/audio/{z_id_str}/power/state", "OFF", retain=True)
+            self.publish_mqtt(f"{self.base_topic}/audio/{z_id_str}/volume/state", "0", retain=True)
+            self.publish_mqtt(f"{self.base_topic}/audio/{z_id_str}/mute/state", "OFF", retain=True)
+            self.publish_mqtt(f"{self.base_topic}/audio/{z_id_str}/source/state", first_src, retain=True)
 
     def _setup_mqtt(self):
         import paho.mqtt.client as mqtt
