@@ -97,7 +97,7 @@ echo "[+] Service '$SERVICE_NAME' enabled on boot."
 # 9. Check configuration and start
 KEY_CHECK=""
 if [ -f "$INSTALL_DIR/config.json" ]; then
-    KEY_CHECK=$(grep -E '"key":\s*"11111111111111111111111111111111"|"key":\s*"00112233445566778899AABBCCDDEEFF"' "$INSTALL_DIR/config.json" || true)
+    KEY_CHECK=$(grep -E '"key":\s*"00112233445566778899AABBCCDDEEFF"' "$INSTALL_DIR/config.json" || true)
 fi
 
 echo ""
