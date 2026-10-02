@@ -37,6 +37,7 @@ Designed for bare-metal Debian hosts and Debian LXC containers / VMs running on 
    - [Unified Media Player Cards (`media_player` Template)](#unified-media-player-cards-media_player-template)
 7. [Protocol Specification & Developer Cheatsheet](#protocol-specification--developer-cheatsheet)
 8. [Troubleshooting & Diagnostics](#troubleshooting--diagnostics)
+9. [Developer & Agent Handover Notes](AGENT_NOTES.md)
 
 ---
 
