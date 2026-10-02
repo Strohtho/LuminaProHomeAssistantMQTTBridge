@@ -254,8 +254,23 @@ PKT_CONTROLLER_SESSION_TERMINATED = 0x06
 PKT_CONTROLLER_CANNOT_START = 0x07
 PKT_OMNILINK_MESSAGE = 0x10  # 16
 PKT_OMNILINK_UNENCRYPTED = 0x11  # 17
+PKT_OMNILINK2_MESSAGE = 0x20  # 32
 
-# enuOmniLink2MessageType
+# enuOmniLinkMessageType (V1 Protocol - used over UDP)
+MSG_V1_DOWNLOAD_SETUP = 0x01
+MSG_V1_ACK = 0x05
+MSG_V1_NAK = 0x06
+MSG_V1_COMMAND = 0x0F  # 15
+MSG_V1_REQUEST_ZONE_STATUS = 0x15  # 21
+MSG_V1_ZONE_STATUS = 0x16  # 22
+MSG_V1_REQUEST_UNIT_STATUS = 0x17  # 23
+MSG_V1_UNIT_STATUS = 0x18  # 24
+MSG_V1_REQUEST_AUX_STATUS = 0x19  # 25
+MSG_V1_AUX_STATUS = 0x1A  # 26
+MSG_V1_REQUEST_AUDIO_ZONE_STATUS = 0x31  # 49
+MSG_V1_AUDIO_ZONE_STATUS = 0x32  # 50
+
+# enuOmniLink2MessageType (V2 Protocol)
 MSG_ACK = 0x01
 MSG_NAK = 0x02
 MSG_COMMAND = 0x14  # 20
@@ -324,9 +339,15 @@ class LuminaController:
             raise ValueError(f"Controller key must be 16 bytes (32 hex characters), got {len(self.controller_key)}")
 
         self.keepalive_interval = float(self.cfg.get("keepalive_interval_sec", 20.0))
-        self.poll_interval = float(self.cfg.get("poll_interval_sec", 10.0))
+        self.poll_interval = float(self.cfg.get("poll_interval_sec", 3.0))
         self.recv_timeout = float(self.cfg.get("receive_timeout_sec", 3.0))
         self.max_retries = int(self.cfg.get("max_retries", 5))
+
+        self.is_v1 = self.cfg.get("protocol", "udp").lower() == "udp"
+        self._pending_zone_start = 1
+        self._pending_aux_start = 1
+        self._pending_audio_start = 1
+        self._pending_unit_start = 1
 
         self.on_status_update = on_status_update
         self.transport: Optional[asyncio.DatagramTransport] = None
@@ -595,20 +616,40 @@ class LuminaController:
 
     async def enable_notifications(self, enable: bool = True):
         """Enables real-time asynchronous notifications on the Lumina Pro controller."""
-        self.logger.info("Enabling real-time notifications on controller...")
-        # Exact wire format from clsOL2EnableNotifications in PCA3D_EN.cs (MessageType 0x15, Data 0x01)
-        payload = bytes([MSG_ENABLE_NOTIFICATIONS, 0x01 if enable else 0x00])
-        await self.send_message(payload, expect_reply=False)
+        if not self.is_v1:
+            self.logger.info("Enabling real-time notifications on controller...")
+            # Exact wire format from clsOL2EnableNotifications in PCA3D_EN.cs (MessageType 0x15, Data 0x01)
+            payload = bytes([MSG_ENABLE_NOTIFICATIONS, 0x01 if enable else 0x00])
+            await self.send_message(payload, expect_reply=False)
+        else:
+            self.logger.info("Operating in Omni-Link V1 (UDP) mode; running active background polling loop (interval=%.1fs)", self.poll_interval)
 
     async def request_status(self, obj_type: int, start_num: int, end_num: int):
-        """Requests status report for a range of objects (Opcode 0x22 - clsOL2MsgRequestStatus)."""
-        payload = struct.pack(">BBHH", MSG_REQUEST_STATUS, obj_type, start_num, end_num)
+        """Requests status report for a range of objects (V1 over UDP or V2 over TCP)."""
+        if self.is_v1:
+            if obj_type == OBJ_ZONE:
+                self._pending_zone_start = start_num
+                payload = bytes([MSG_V1_REQUEST_ZONE_STATUS, start_num & 0xFF, end_num & 0xFF])
+            elif obj_type == OBJ_AUXILLARY:
+                self._pending_aux_start = start_num
+                payload = bytes([MSG_V1_REQUEST_AUX_STATUS, start_num & 0xFF, end_num & 0xFF])
+            elif obj_type == OBJ_AUDIO_ZONE:
+                self._pending_audio_start = start_num
+                payload = bytes([MSG_V1_REQUEST_AUDIO_ZONE_STATUS, start_num & 0xFF, end_num & 0xFF])
+            elif obj_type == OBJ_UNIT:
+                self._pending_unit_start = start_num
+                payload = bytes([MSG_V1_REQUEST_UNIT_STATUS, start_num & 0xFF, end_num & 0xFF])
+            else:
+                return
+        else:
+            payload = struct.pack(">BBHH", MSG_REQUEST_STATUS, obj_type, start_num, end_num)
         await self.send_message(payload, expect_reply=False)
 
     async def send_command(self, cmd: int, param: int, target: int):
-        """Dispatches direct command (Opcode 0x14 - clsOL2MsgCommand)."""
-        payload = struct.pack(">BBBH", MSG_COMMAND, cmd, param, target)
-        self.logger.debug("Dispatching command: cmd=%d, param=%d, target=%d (payload: %s)", cmd, param, target, payload.hex())
+        """Dispatches direct command (Opcode 0x0F for V1 / 0x14 for V2)."""
+        opcode = MSG_V1_COMMAND if self.is_v1 else MSG_COMMAND
+        payload = struct.pack(">BBBH", opcode, cmd, param, target)
+        self.logger.debug("Dispatching command: opcode=0x%02X, cmd=%d, param=%d, target=%d (payload: %s)", opcode, cmd, param, target, payload.hex())
         await self.send_message(payload, expect_reply=False)
 
     async def request_initial_statuses(self):
@@ -616,13 +657,13 @@ class LuminaController:
         self.logger.info("Querying initial object statuses from controller...")
         # 1. Environmental & Motion Sensors (Zones 1 to 16)
         await self.request_status(OBJ_ZONE, 1, 16)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         # 2. Auxiliary Sensors (Dining Temp Zone 1, Dining Hum Zone 2)
         await self.request_status(OBJ_AUXILLARY, 1, 4)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         # 3. Window contact sensors (Zones 48 to 60)
         await self.request_status(OBJ_ZONE, 48, 60)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
         # 4. Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
         await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
@@ -631,8 +672,8 @@ class LuminaController:
         while self._running:
             await asyncio.sleep(self.keepalive_interval)
             if self._online_secure:
-                # Send clsOL2MsgAcknowledge (MessageType 0x01)
-                ack_payload = bytes([MSG_ACK])
+                # Send V1 Ack (0x05) on UDP or V2 Ack (0x01) on TCP
+                ack_payload = bytes([MSG_V1_ACK if self.is_v1 else MSG_ACK])
                 await self.send_message(ack_payload, expect_reply=False)
             else:
                 await self._establish_session()
@@ -643,36 +684,116 @@ class LuminaController:
             await asyncio.sleep(self.poll_interval)
             if self._online_secure:
                 await self.request_status(OBJ_ZONE, 1, 16)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 await self.request_status(OBJ_AUXILLARY, 1, 4)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 await self.request_status(OBJ_ZONE, 48, 60)
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
                 await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
     def _handle_omnilink_message(self, msg: bytes):
-        """Parses decoded Omni-Link II message payloads."""
+        """Parses decoded Omni-Link message payloads (supports both V1 and V2 formats)."""
         if not msg:
             return
         msg_type = msg[0]
 
-        # Status Report (0x23 / 35)
-        if msg_type == MSG_STATUS_REPORT:
+        # --- Omni-Link 1 Messages (UDP Protocol) ---
+        if msg_type == MSG_V1_ZONE_STATUS:
+            self._parse_v1_zone_report(msg)
+        elif msg_type == MSG_V1_AUX_STATUS:
+            self._parse_v1_aux_report(msg)
+        elif msg_type == MSG_V1_AUDIO_ZONE_STATUS:
+            self._parse_v1_audio_report(msg)
+        elif msg_type == MSG_V1_UNIT_STATUS:
+            self._parse_v1_unit_report(msg)
+        elif msg_type == MSG_V1_ACK:
+            self.logger.info("Received Controller V1 ACK (0x05)")
+        elif msg_type == MSG_V1_NAK:
+            self.logger.warning("Received Controller V1 NAK (0x06) - Controller rejected previous request")
+
+        # --- Omni-Link 2 Messages (TCP / Extended Protocol) ---
+        elif msg_type == MSG_STATUS_REPORT:
             self._parse_status_report(msg)
-        # Extended Status Report (0x3B / 59)
         elif msg_type == MSG_EXT_STATUS_REPORT:
             self._parse_ext_status_report(msg)
-        # System Events (0x37 / 55)
         elif msg_type == MSG_SYSTEM_EVENTS and len(msg) >= 3:
             event_code = (msg[1] << 8) | msg[2]
             self.logger.info("Received System Event notification: 0x%04X", event_code)
             asyncio.create_task(self.request_initial_statuses())
         elif msg_type == MSG_ACK:
-            self.logger.info("Received Controller ACK (0x01)")
+            self.logger.info("Received Controller V2 ACK (0x01)")
         elif msg_type == MSG_NAK:
-            self.logger.warning("Received Controller NAK (0x02) - Controller rejected previous request")
+            self.logger.warning("Received Controller V2 NAK (0x02) - Controller rejected previous request")
         else:
-            self.logger.info("Received OmniLink message: type=0x%02X, len=%d", msg_type, len(msg))
+            self.logger.info("Received OmniLink message: type=0x%02X, len=%d, hex=%s", msg_type, len(msg), msg.hex())
+
+    def _parse_v1_zone_report(self, msg: bytes):
+        """Unpacks OmniLink 1 zone status report (Opcode 0x16: 2 bytes per zone [status, loop])."""
+        data = msg[1:]
+        start_zone = self._pending_zone_start
+        for i in range(0, len(data), 2):
+            if i + 2 > len(data):
+                break
+            zone_num = start_zone + (i // 2)
+            status_byte = data[i]
+            analog_loop = data[i + 1]
+            self.logger.info("Zone %d report (V1): status=0x%02X, loop=%d", zone_num, status_byte, analog_loop)
+            if self.on_status_update:
+                self.on_status_update("zone", zone_num, {"status": status_byte, "loop": analog_loop})
+
+    def _parse_v1_aux_report(self, msg: bytes):
+        """Unpacks OmniLink 1 auxiliary sensor report (Opcode 0x1A: 4 bytes per sensor [relay, temp, low, high])."""
+        data = msg[1:]
+        start_aux = self._pending_aux_start
+        for i in range(0, len(data), 4):
+            if i + 4 > len(data):
+                break
+            aux_num = start_aux + (i // 4)
+            relay = data[i]
+            raw_temp = data[i + 1]
+            low = data[i + 2]
+            high = data[i + 3]
+            self.logger.info("Aux sensor %d report (V1): raw_temp=%d, relay=0x%02X, low=%d, high=%d", aux_num, raw_temp, relay, low, high)
+            if self.on_status_update:
+                self.on_status_update("aux", aux_num, {
+                    "temp": raw_temp,
+                    "output": relay,
+                    "low": low,
+                    "high": high
+                })
+
+    def _parse_v1_audio_report(self, msg: bytes):
+        """Unpacks OmniLink 1 audio zone report (Opcode 0x32: 4 bytes per audio zone [power, source, volume, mute])."""
+        data = msg[1:]
+        start_audio = self._pending_audio_start
+        for i in range(0, len(data), 4):
+            if i + 4 > len(data):
+                break
+            audio_num = start_audio + (i // 4)
+            power = data[i] != 0
+            source = data[i + 1]
+            volume = data[i + 2]
+            mute = data[i + 3] != 0
+            self.logger.info("Audio zone %d report (V1): power=%s, vol=%d, src=%d, mute=%s", audio_num, power, volume, source, mute)
+            if self.on_status_update:
+                self.on_status_update("audio", audio_num, {
+                    "power": power,
+                    "source": source,
+                    "volume": volume,
+                    "mute": mute
+                })
+
+    def _parse_v1_unit_report(self, msg: bytes):
+        """Unpacks OmniLink 1 unit report (Opcode 0x18: 3 bytes per unit [status, time_h, time_l])."""
+        data = msg[1:]
+        start_unit = self._pending_unit_start
+        for i in range(0, len(data), 3):
+            if i + 3 > len(data):
+                break
+            unit_num = start_unit + (i // 3)
+            status = data[i]
+            if self.on_status_update:
+                self.on_status_update("unit", unit_num, {"status": status})
 
     def _parse_status_report(self, msg: bytes):
         """Unpacks standard status reports (clsOL2MsgStatus)."""

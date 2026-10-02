@@ -4,7 +4,7 @@
     "port": 4369,
     "key": "00112233445566778899AABBCCDDEEFF",
     "keepalive_interval_sec": 20,
-    "poll_interval_sec": 10,
+    "poll_interval_sec": 3,
     "receive_timeout_sec": 3.0,
     "max_retries": 5
   },
