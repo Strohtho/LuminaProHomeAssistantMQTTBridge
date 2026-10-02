@@ -210,8 +210,37 @@ def calculate_omnilink_crc16(data: bytes) -> int:
     return crc
 
 
+def _extract_omnilink_payload(dec: bytearray) -> Optional[bytes]:
+    """Validates framing and CRC-16 of decrypted OmniLink frame bytes."""
+    if len(dec) < 4:
+        return None
+
+    # Format 0x5A (Non-addressable UDP) and 0x21 (OmniLink2)
+    if dec[0] in (0x5A, 0x21):
+        msg_len = dec[1]
+        if len(dec) >= 2 + msg_len + 2:
+            payload = bytes(dec[2 : 2 + msg_len])
+            crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
+            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
+            if crc_recv == crc_calc:
+                return payload
+
+    # Format 0x41 (Addressable)
+    elif dec[0] == 0x41 and len(dec) >= 5:
+        msg_len = dec[2]
+        if len(dec) >= 3 + msg_len + 2:
+            payload = bytes(dec[3 : 3 + msg_len])
+            crc_recv = dec[3 + msg_len] | (dec[3 + msg_len + 1] << 8)
+            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
+            if crc_recv == crc_calc:
+                return payload
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Protocol Constants & Enums (Extracted from PCA3D_EN.cs)
+
 # ---------------------------------------------------------------------------
 OMNILINK_START_CHAR = 0x5A  # enuOmniLinkMessageFormat.NonAddressable (90)
 
@@ -484,34 +513,6 @@ class LuminaController:
 
         enc = aes_encrypt_ecb(self._session_key, bytes(padded))
         return struct.pack(">HBB", seq, PKT_OMNILINK_MESSAGE, 0x00) + enc
-
-def _extract_omnilink_payload(dec: bytearray) -> Optional[bytes]:
-    """Validates framing and CRC-16 of decrypted OmniLink frame bytes."""
-    if len(dec) < 4:
-        return None
-
-    # Format 0x5A (Non-addressable UDP) and 0x21 (OmniLink2)
-    if dec[0] in (0x5A, 0x21):
-        msg_len = dec[1]
-        if len(dec) >= 2 + msg_len + 2:
-            payload = bytes(dec[2 : 2 + msg_len])
-            crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
-            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
-            if crc_recv == crc_calc:
-                return payload
-
-    # Format 0x41 (Addressable)
-    elif dec[0] == 0x41 and len(dec) >= 5:
-        msg_len = dec[2]
-        if len(dec) >= 3 + msg_len + 2:
-            payload = bytes(dec[3 : 3 + msg_len])
-            crc_recv = dec[3 + msg_len] | (dec[3 + msg_len + 1] << 8)
-            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
-            if crc_recv == crc_calc:
-                return payload
-
-    return None
-
 
     def _decrypt_omnilink_message(self, seq: int, data: bytes) -> Optional[bytes]:
         """Decrypts and verifies CRC of an incoming OmniLink application frame."""
