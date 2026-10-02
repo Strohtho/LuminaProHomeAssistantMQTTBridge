@@ -9,7 +9,7 @@ Type=simple
 User=lumina
 Group=lumina
 WorkingDirectory=/opt/lumina-bridge
-ExecStart=/opt/lumina-bridge/venv/bin/python /opt/lumina-bridge/lumina_bridge.py -c /opt/lumina-bridge/config.json
+ExecStart=/opt/lumina-bridge/venv/bin/python /opt/lumina-bridge/lumina_bridge.py -c /opt/lumina-bridge/config.json -v
 Restart=always
 RestartSec=5s
 

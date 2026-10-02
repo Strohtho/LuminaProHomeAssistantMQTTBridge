@@ -240,6 +240,7 @@ MSG_EXT_STATUS_REPORT = 0x3B  # 59
 # enuObjectType
 OBJ_ZONE = 0x01
 OBJ_UNIT = 0x02
+OBJ_AUXILLARY = 0x08  # 8 in decimal - Temperature & Humidity sensors
 OBJ_AUDIO_ZONE = 0x0A  # 10 in decimal
 
 # enuUnitCommand
@@ -309,6 +310,7 @@ class LuminaController:
         self._pending_requests: Dict[int, asyncio.Future] = {}
         self._running = False
         self._handshake_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -368,14 +370,14 @@ class LuminaController:
             return
 
         payload = data[4:]
-        self.logger.debug("Received UDP datagram: seq=%d, type=0x%02X, len=%d", seq_num, pkt_type, len(data))
+        self.logger.info("Received UDP datagram: seq=%d, type=0x%02X, len=%d", seq_num, pkt_type, len(data))
 
         # Check for matching pending request (e.g. handshake requests)
         future = self._pending_requests.get(seq_num)
         if future and not future.done():
             future.set_result((pkt_type, payload))
 
-        # Always decrypt and process application message frames (OmniLink1 0x10 & OmniLink2 0x20)
+        # Decrypt and process application message frames (OmniLink1 0x10 & OmniLink2 0x20)
         if pkt_type in (PKT_OMNILINK_MESSAGE, 0x20) and self._session_key:
             msg = self._decrypt_omnilink_message(seq_num, payload)
             if msg:
@@ -483,55 +485,84 @@ class LuminaController:
         enc = aes_encrypt_ecb(self._session_key, bytes(padded))
         return struct.pack(">HBB", seq, PKT_OMNILINK_MESSAGE, 0x00) + enc
 
+def _extract_omnilink_payload(dec: bytearray) -> Optional[bytes]:
+    """Validates framing and CRC-16 of decrypted OmniLink frame bytes."""
+    if len(dec) < 4:
+        return None
+
+    # Format 0x5A (Non-addressable UDP) and 0x21 (OmniLink2)
+    if dec[0] in (0x5A, 0x21):
+        msg_len = dec[1]
+        if len(dec) >= 2 + msg_len + 2:
+            payload = bytes(dec[2 : 2 + msg_len])
+            crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
+            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
+            if crc_recv == crc_calc:
+                return payload
+
+    # Format 0x41 (Addressable)
+    elif dec[0] == 0x41 and len(dec) >= 5:
+        msg_len = dec[2]
+        if len(dec) >= 3 + msg_len + 2:
+            payload = bytes(dec[3 : 3 + msg_len])
+            crc_recv = dec[3 + msg_len] | (dec[3 + msg_len + 1] << 8)
+            crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
+            if crc_recv == crc_calc:
+                return payload
+
+    return None
+
+
     def _decrypt_omnilink_message(self, seq: int, data: bytes) -> Optional[bytes]:
         """Decrypts and verifies CRC of an incoming OmniLink application frame."""
         if not self._session_key or len(data) < 16 or len(data) % 16 != 0:
             return None
 
-        # 1. Try with packet sequence number masking (standard)
-        dec = bytearray(aes_decrypt_ecb(self._session_key, data))
+        raw_dec = bytearray(aes_decrypt_ecb(self._session_key, data))
         seq_h = (seq >> 8) & 0xFF
         seq_l = seq & 0xFF
-        for offset in range(0, len(dec), 16):
-            dec[offset] ^= seq_h
-            dec[offset + 1] ^= seq_l
 
-        # Frame structure: [StartChar, Length, Data..., CRC_Low, CRC_High, (Padding)]
-        if len(dec) >= 4 and dec[0] in (0x5A, 0x21):
-            msg_len = dec[1]
-            if len(dec) >= 2 + msg_len + 2:
-                payload = bytes(dec[2 : 2 + msg_len])
-                crc_recv = dec[2 + msg_len] | (dec[2 + msg_len + 1] << 8)
-                crc_calc = calculate_omnilink_crc16(bytes([msg_len]) + payload)
-                if crc_recv == crc_calc:
-                    return payload
+        # 1. Standard: All 16-byte blocks unmasked with sequence number
+        dec_all = bytearray(raw_dec)
+        for offset in range(0, len(dec_all), 16):
+            dec_all[offset] ^= seq_h
+            dec_all[offset + 1] ^= seq_l
+        p = _extract_omnilink_payload(dec_all)
+        if p is not None:
+            return p
 
-        # 2. Fallback: If seq != 0 failed CRC, try unmasking with seq=0 (unmasked payload)
-        if seq != 0:
-            dec0 = bytearray(aes_decrypt_ecb(self._session_key, data))
-            if len(dec0) >= 4 and dec0[0] in (0x5A, 0x21):
-                msg_len0 = dec0[1]
-                if len(dec0) >= 2 + msg_len0 + 2:
-                    payload0 = bytes(dec0[2 : 2 + msg_len0])
-                    crc_recv0 = dec0[2 + msg_len0] | (dec0[2 + msg_len0 + 1] << 8)
-                    crc_calc0 = calculate_omnilink_crc16(bytes([msg_len0]) + payload0)
-                    if crc_recv0 == crc_calc0:
-                        return payload0
+        # 2. Variant: Block 0 unmasked only
+        if len(raw_dec) > 16:
+            dec_b0 = bytearray(raw_dec)
+            dec_b0[0] ^= seq_h
+            dec_b0[1] ^= seq_l
+            p = _extract_omnilink_payload(dec_b0)
+            if p is not None:
+                return p
 
-        self.logger.debug("OmniLink frame decrypt failed or CRC mismatch (seq=%d)", seq)
+        # 3. Unsolicited / Unmasked: No sequence masking (seq=0)
+        p = _extract_omnilink_payload(bytearray(raw_dec))
+        if p is not None:
+            return p
+
+        self.logger.warning(
+            "OmniLink frame decrypt failed (seq=%d, len=%d): raw_dec=[%s]",
+            seq, len(data), " ".join(f"{b:02X}" for b in raw_dec[:16])
+        )
         return None
 
-    async def send_message(self, payload: bytes, expect_reply: bool = True) -> Optional[bytes]:
+    async def send_message(self, payload: bytes, expect_reply: bool = False) -> Optional[bytes]:
         """Sends an encrypted OmniLink message with sequence matching and automatic retry."""
         if not self._online_secure:
             if not await self._establish_session():
                 return None
 
-        for attempt in range(1, self.max_retries + 1):
+        async with self._send_lock:
             seq = self._next_seq()
             pkt = self._encrypt_omnilink_message(seq, payload)
 
             if not expect_reply:
+                self.logger.debug("Sending message seq=%d (len=%d)", seq, len(payload))
                 self.transport.sendto(pkt)
                 return None
 
@@ -543,7 +574,7 @@ class LuminaController:
                 pkt_type, resp_payload = await asyncio.wait_for(fut, timeout=self.recv_timeout)
                 self._pending_requests.pop(seq, None)
 
-                if pkt_type == PKT_OMNILINK_MESSAGE:
+                if pkt_type in (PKT_OMNILINK_MESSAGE, 0x20):
                     msg = self._decrypt_omnilink_message(seq, resp_payload)
                     if msg:
                         self._handle_omnilink_message(msg)
@@ -554,35 +585,23 @@ class LuminaController:
                     await self._establish_session()
             except asyncio.TimeoutError:
                 self._pending_requests.pop(seq, None)
-                self.logger.debug("Request seq=%d timed out (attempt %d/%d)", seq, attempt, self.max_retries)
+                self.logger.debug("Request seq=%d timed out", seq)
             except Exception as e:
                 self._pending_requests.pop(seq, None)
                 self.logger.error("Error during send_message: %s", e)
 
-            await asyncio.sleep(0.5)
-
-        self.logger.warning("Message send failed after %d retries; marking session offline", self.max_retries)
-        self._online_secure = False
-        return None
+            return None
 
     async def enable_notifications(self, enable: bool = True):
         """Enables real-time asynchronous notifications on the Lumina Pro controller."""
-        self.logger.info("Enabling real-time notifications...")
+        self.logger.info("Enabling real-time notifications on controller...")
         # Exact wire format from clsOL2EnableNotifications in PCA3D_EN.cs (MessageType 0x15, Data 0x01)
-        payload_15 = bytes([MSG_ENABLE_NOTIFICATIONS, 0x01 if enable else 0x00])
-        await self.send_message(payload_15, expect_reply=False)
-        # Also send opcode 0x38 as compatibility fallback
-        payload_38 = bytes([0x38, 0x01 if enable else 0x00])
-        await self.send_message(payload_38, expect_reply=False)
-
-    async def request_status(self, obj_type: int, start_num: int, end_num: int):
-        """Requests status report for a range of objects (Opcode 0x22)."""
-        payload = struct.pack(">BBHH", MSG_REQUEST_STATUS, obj_type, start_num, end_num)
+        payload = bytes([MSG_ENABLE_NOTIFICATIONS, 0x01 if enable else 0x00])
         await self.send_message(payload, expect_reply=False)
 
-    async def request_ext_status(self, obj_type: int, start_num: int, end_num: int):
-        """Requests extended status report for a range of objects (Opcode 0x3A)."""
-        payload = struct.pack(">BBHH", MSG_REQUEST_EXT_STATUS, obj_type, start_num, end_num)
+    async def request_status(self, obj_type: int, start_num: int, end_num: int):
+        """Requests status report for a range of objects (Opcode 0x22 - clsOL2MsgRequestStatus)."""
+        payload = struct.pack(">BBHH", MSG_REQUEST_STATUS, obj_type, start_num, end_num)
         await self.send_message(payload, expect_reply=False)
 
     async def send_command(self, cmd: int, param: int, target: int):
@@ -594,18 +613,17 @@ class LuminaController:
     async def request_initial_statuses(self):
         """Queries initial status for all active sensors, window contacts, and audio zones."""
         self.logger.info("Querying initial object statuses from controller...")
-        # Zones 1 to 16 (Temp 1, Hum 2, Motion 8, 9, 10)
+        # 1. Environmental & Motion Sensors (Zones 1 to 16)
         await self.request_status(OBJ_ZONE, 1, 16)
-        await asyncio.sleep(0.1)
-        await self.request_ext_status(OBJ_ZONE, 1, 16)
-        await asyncio.sleep(0.1)
-        # Zones 48 to 60 (Window contact sensors 49..55)
+        await asyncio.sleep(0.3)
+        # 2. Auxiliary Sensors (Dining Temp Zone 1, Dining Hum Zone 2)
+        await self.request_status(OBJ_AUXILLARY, 1, 4)
+        await asyncio.sleep(0.3)
+        # 3. Window contact sensors (Zones 48 to 60)
         await self.request_status(OBJ_ZONE, 48, 60)
-        await asyncio.sleep(0.1)
-        # Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
+        await asyncio.sleep(0.3)
+        # 4. Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
         await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
-        await asyncio.sleep(0.1)
-        await self.request_ext_status(OBJ_AUDIO_ZONE, 1, 4)
 
     async def _watchdog_loop(self):
         """Periodic keep-alive watchdog matching clsOmniLinkConnection.WatchdogTimeout."""
@@ -624,9 +642,11 @@ class LuminaController:
             await asyncio.sleep(self.poll_interval)
             if self._online_secure:
                 await self.request_status(OBJ_ZONE, 1, 16)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
+                await self.request_status(OBJ_AUXILLARY, 1, 4)
+                await asyncio.sleep(0.3)
                 await self.request_status(OBJ_ZONE, 48, 60)
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.3)
                 await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
     def _handle_omnilink_message(self, msg: bytes):
@@ -635,19 +655,23 @@ class LuminaController:
             return
         msg_type = msg[0]
 
-        # Status Report (0x23)
+        # Status Report (0x23 / 35)
         if msg_type == MSG_STATUS_REPORT:
             self._parse_status_report(msg)
-        # Extended Status Report (0x3B)
+        # Extended Status Report (0x3B / 59)
         elif msg_type == MSG_EXT_STATUS_REPORT:
             self._parse_ext_status_report(msg)
-        # System Events (0x37)
+        # System Events (0x37 / 55)
         elif msg_type == MSG_SYSTEM_EVENTS and len(msg) >= 3:
             event_code = (msg[1] << 8) | msg[2]
             self.logger.info("Received System Event notification: 0x%04X", event_code)
             asyncio.create_task(self.request_initial_statuses())
+        elif msg_type == MSG_ACK:
+            self.logger.info("Received Controller ACK (0x01)")
+        elif msg_type == MSG_NAK:
+            self.logger.warning("Received Controller NAK (0x02) - Controller rejected previous request")
         else:
-            self.logger.debug("Received OmniLink message type: 0x%02X", msg_type)
+            self.logger.info("Received OmniLink message: type=0x%02X, len=%d", msg_type, len(msg))
 
     def _parse_status_report(self, msg: bytes):
         """Unpacks standard status reports (clsOL2MsgStatus)."""
@@ -667,6 +691,25 @@ class LuminaController:
                 self.logger.info("Zone %d report: status=0x%02X, loop=%d", obj_num, status_byte, analog_loop)
                 if self.on_status_update:
                     self.on_status_update("zone", obj_num, {"status": status_byte, "loop": analog_loop})
+
+        # Auxiliary Sensors (6 bytes per record - Temperature & Humidity!)
+        elif obj_type == OBJ_AUXILLARY:
+            for i in range(0, len(data), 6):
+                if i + 6 > len(data):
+                    break
+                obj_num = (data[i] << 8) | data[i + 1]
+                output = data[i + 2]
+                raw_temp = data[i + 3]
+                low = data[i + 4]
+                high = data[i + 5]
+                self.logger.info("Aux sensor %d report: raw_temp=%d, output=0x%02X, low=%d, high=%d", obj_num, raw_temp, output, low, high)
+                if self.on_status_update:
+                    self.on_status_update("aux", obj_num, {
+                        "temp": raw_temp,
+                        "output": output,
+                        "low": low,
+                        "high": high
+                    })
 
         # Audio Zones (6 bytes per record)
         elif obj_type == OBJ_AUDIO_ZONE:
@@ -895,7 +938,23 @@ class LuminaMqttBridge:
 
     def _on_lumina_status(self, entity_type: str, obj_num: int, data: dict):
         """Dispatches status updates from Lumina controller to MQTT."""
-        if entity_type == "zone":
+        if entity_type == "aux":
+            for s_key, scfg in self.sensors.items():
+                if int(scfg["zone"]) == obj_num:
+                    stype = scfg.get("type", "")
+                    raw_val = data.get("temp", 0)
+                    if raw_val > 0:
+                        # Leviton/HAI temperature & humidity decoding formula:
+                        # decoded = (raw_val * 9.0 / 10.0) - 40.0
+                        decoded = (raw_val * 0.9) - 40.0
+                        if stype in ("temperature_er", "temperature"):
+                            self.logger.info("Publishing %s (%s) Temp: %.1f °F", scfg.get("name", s_key), s_key, decoded)
+                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/temperature", f"{decoded:.1f}", retain=True)
+                        elif stype == "humidity":
+                            self.logger.info("Publishing %s (%s) Humidity: %.0f %%", scfg.get("name", s_key), s_key, decoded)
+                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/humidity", f"{decoded:.0f}", retain=True)
+
+        elif entity_type == "zone":
             # Check configured environmental & motion sensors
             for s_key, scfg in self.sensors.items():
                 if int(scfg["zone"]) == obj_num:
@@ -904,17 +963,21 @@ class LuminaMqttBridge:
                     status_byte = data.get("status", 0)
 
                     if stype in ("temperature_er", "temperature"):
-                        # Only publish if loop_val > 0 to avoid spurious -40°F on startup
                         if loop_val > 0:
-                            temp_f = -40.0 + (0.5 * loop_val)
+                            temp_f = (loop_val * 0.9) - 40.0
+                            self.logger.info("Publishing %s (%s) Temp (from loop): %.1f °F", scfg.get("name", s_key), s_key, temp_f)
                             self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/temperature", f"{temp_f:.1f}", retain=True)
                     elif stype == "humidity":
                         if loop_val > 0:
-                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/humidity", str(loop_val), retain=True)
+                            hum_val = (loop_val * 0.9) - 40.0
+                            self.logger.info("Publishing %s (%s) Humidity (from loop): %.0f %%", scfg.get("name", s_key), s_key, hum_val)
+                            self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/humidity", f"{hum_val:.0f}", retain=True)
                     elif stype in ("motion", "contact", "window", "door"):
-                        # Tripped: Bit 0 of status byte = 1 (tripped/not ready)
+                        # Tripped: Bit 0 of status byte = 1 (tripped/not ready), 0 = secure/ready
                         tripped = (status_byte & 0x01) != 0
-                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", "ON" if tripped else "OFF", retain=True)
+                        state_str = "ON" if tripped else "OFF"
+                        self.logger.info("Sensor %s (zone %d): %s (status=0x%02X)", s_key, obj_num, state_str, status_byte)
+                        self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", state_str, retain=True)
 
             # Check window contacts (covers & contact binary sensors)
             for w_key, w in self.windows.items():
@@ -922,7 +985,9 @@ class LuminaMqttBridge:
                     status_byte = data.get("status", 0)
                     w.update_contact(status_byte)
                     is_open = (status_byte & 0x01) != 0
-                    self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", "ON" if is_open else "OFF", retain=True)
+                    state_str = "ON" if is_open else "OFF"
+                    self.logger.info("Window contact %s (zone %d): %s (status=0x%02X)", w_key, obj_num, state_str, status_byte)
+                    self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", state_str, retain=True)
 
         elif entity_type == "audio":
             zone_id_str = str(obj_num)
@@ -932,6 +997,7 @@ class LuminaMqttBridge:
                 volume = data.get("volume", 0)
                 mute = data.get("mute", False)
 
+                self.logger.info("Audio Zone %s (%s): power=%s, vol=%d, src=%d, mute=%s", zone_id_str, self.audio_zones[zone_id_str].get("name"), power, volume, source_id, mute)
                 self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/power/state", "ON" if power else "OFF", retain=True)
                 self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/volume/state", str(volume), retain=True)
                 self.publish_mqtt(f"{self.base_topic}/audio/{obj_num}/mute/state", "ON" if mute else "OFF", retain=True)
