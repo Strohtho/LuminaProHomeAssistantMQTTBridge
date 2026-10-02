@@ -653,7 +653,7 @@ class LuminaController:
         await self.send_message(payload, expect_reply=False)
 
     async def request_initial_statuses(self):
-        """Queries initial status for all active sensors, window contacts, and audio zones."""
+        """Queries initial status for all active sensors and audio zones."""
         self.logger.info("Querying initial object statuses from controller...")
         # 1. Environmental & Motion Sensors (Zones 1 to 16)
         await self.request_status(OBJ_ZONE, 1, 16)
@@ -661,10 +661,7 @@ class LuminaController:
         # 2. Auxiliary Sensors (Dining Temp Zone 1, Dining Hum Zone 2)
         await self.request_status(OBJ_AUXILLARY, 1, 4)
         await asyncio.sleep(0.2)
-        # 3. Window contact sensors (Zones 48 to 60)
-        await self.request_status(OBJ_ZONE, 48, 60)
-        await asyncio.sleep(0.2)
-        # 4. Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
+        # 3. Audio Zones 1 to 4 (Living, Dining, Bath, Bed)
         await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
     async def _watchdog_loop(self):
@@ -686,8 +683,6 @@ class LuminaController:
                 await self.request_status(OBJ_ZONE, 1, 16)
                 await asyncio.sleep(0.2)
                 await self.request_status(OBJ_AUXILLARY, 1, 4)
-                await asyncio.sleep(0.2)
-                await self.request_status(OBJ_ZONE, 48, 60)
                 await asyncio.sleep(0.2)
                 await self.request_status(OBJ_AUDIO_ZONE, 1, 4)
 
@@ -909,7 +904,7 @@ class WindowActuator:
     def __init__(self, key: str, config: dict, lumina: LuminaController, publish_callback):
         self.key = key
         self.name = config.get("name", key)
-        self.contact_zone = int(config["contact_zone"])
+        self.contact_zone = int(config.get("contact_zone", 0))
         self.open_unit = int(config["open_unit"])
         self.close_unit = int(config["close_unit"])
         self.runtime = float(config.get("runtime_sec", 60.0))
@@ -921,26 +916,6 @@ class WindowActuator:
         self.state = "closed"
         self._motion_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
-
-    def update_contact(self, status_byte: int):
-        """Called when zone contact sensor updates."""
-        # Bit 0 = 0 means loop is secure/closed. Bit 0 = 1 means tripped/open.
-        is_closed = (status_byte & 0x01) == 0
-
-        # If currently moving, stop early if contact becomes closed during closing
-        if self.state == "closing" and is_closed:
-            self.logger.info("%s reached closed position; turning off relay early", self.name)
-            if self._motion_task and not self._motion_task.done():
-                self._motion_task.cancel()
-            asyncio.create_task(self._finish_stop("closed"))
-            return
-
-        # If not moving, sync state with physical contact
-        if self.state not in ("opening", "closing"):
-            new_state = "closed" if is_closed else "open"
-            if new_state != self.state:
-                self.state = new_state
-                self.publish(f"{self.lumina.cfg.get('base_topic', 'lumina')}/cover/{self.key}/state", self.state, retain=True)
 
     async def handle_command(self, cmd: str):
         cmd = cmd.strip().upper()
@@ -995,13 +970,6 @@ class WindowActuator:
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.open_unit)
         await self.lumina.send_command(CMD_UNIT_OFF, 0, self.close_unit)
         self.state = "stopped"
-        base_topic = self.lumina.cfg.get("base_topic", "lumina")
-        self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
-
-    async def _finish_stop(self, final_state: str):
-        await self.lumina.send_command(CMD_UNIT_OFF, 0, self.open_unit)
-        await self.lumina.send_command(CMD_UNIT_OFF, 0, self.close_unit)
-        self.state = final_state
         base_topic = self.lumina.cfg.get("base_topic", "lumina")
         self.publish(f"{base_topic}/cover/{self.key}/state", self.state, retain=True)
 
@@ -1101,16 +1069,6 @@ class LuminaMqttBridge:
                         self.logger.info("Sensor %s (zone %d): %s (status=0x%02X)", s_key, obj_num, state_str, status_byte)
                         self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", state_str, retain=True)
 
-            # Check window contacts (covers & contact binary sensors)
-            for w_key, w in self.windows.items():
-                if w.contact_zone == obj_num:
-                    status_byte = data.get("status", 0)
-                    w.update_contact(status_byte)
-                    is_open = (status_byte & 0x01) != 0
-                    state_str = "ON" if is_open else "OFF"
-                    self.logger.info("Window contact %s (zone %d): %s (status=0x%02X)", w_key, obj_num, state_str, status_byte)
-                    self.publish_mqtt(f"{self.base_topic}/zone/{obj_num}/state", state_str, retain=True)
-
         elif entity_type == "audio":
             zone_id_str = str(obj_num)
             if zone_id_str in self.audio_zones:
@@ -1131,11 +1089,9 @@ class LuminaMqttBridge:
         """Re-publishes known states of all entities to MQTT with retention."""
         self.logger.info("Publishing initial state snapshots for all entities...")
 
-        # 1. Covers & Window Physical Contacts
+        # 1. Covers
         for w_key, w in self.windows.items():
             self.publish_mqtt(f"{self.base_topic}/cover/{w_key}/state", w.state, retain=True)
-            if w.contact_zone > 0:
-                self.publish_mqtt(f"{self.base_topic}/zone/{w.contact_zone}/state", "OFF", retain=True)
 
         # 2. Binary Motion & Environmental Sensors
         for s_key, scfg in self.sensors.items():
@@ -1356,21 +1312,9 @@ class LuminaMqttBridge:
             }
             self.publish_mqtt(disc_topic, json.dumps(payload), retain=True)
 
-            # Window Physical Contact Sensor
-            contact_zone = int(wcfg.get("contact_zone", 0))
-            if contact_zone > 0:
-                contact_disc_topic = f"{self.disc_prefix}/binary_sensor/lumina/{w_key}_contact/config"
-                contact_payload = {
-                    "name": f"{name} Contact",
-                    "unique_id": f"lumina_window_{w_key}_contact",
-                    "state_topic": f"{self.base_topic}/zone/{contact_zone}/state",
-                    "payload_on": "ON",
-                    "payload_off": "OFF",
-                    "device_class": "window",
-                    "availability_topic": self.avail_topic,
-                    "device": device_info
-                }
-                self.publish_mqtt(contact_disc_topic, json.dumps(contact_payload), retain=True)
+            # Clean up / unregister any previous window contact sensors from Home Assistant
+            contact_disc_topic = f"{self.disc_prefix}/binary_sensor/lumina/{w_key}_contact/config"
+            self.publish_mqtt(contact_disc_topic, "", retain=True)
 
 
         # 3. HAI Hi-Fi 2 Audio System (4 Zones)

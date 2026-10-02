@@ -20,49 +20,42 @@
   "windows": {
     "win_1_1": {
       "name": "Window 1-1",
-      "contact_zone": 49,
       "open_unit": 265,
       "close_unit": 257,
       "runtime_sec": 60
     },
     "win_1_2": {
       "name": "Window 1-2",
-      "contact_zone": 50,
       "open_unit": 266,
       "close_unit": 258,
       "runtime_sec": 60
     },
     "win_1_3": {
       "name": "Window 1-3",
-      "contact_zone": 51,
       "open_unit": 267,
       "close_unit": 259,
       "runtime_sec": 60
     },
     "win_2_1": {
       "name": "Window 2-1",
-      "contact_zone": 52,
       "open_unit": 268,
       "close_unit": 260,
       "runtime_sec": 60
     },
     "win_2_3": {
       "name": "Window 2-3",
-      "contact_zone": 53,
       "open_unit": 269,
       "close_unit": 261,
       "runtime_sec": 60
     },
     "win_3_1": {
       "name": "Window 3-1",
-      "contact_zone": 54,
       "open_unit": 270,
       "close_unit": 262,
       "runtime_sec": 60
     },
     "win_3_3": {
       "name": "Window 3-3",
-      "contact_zone": 55,
       "open_unit": 271,
       "close_unit": 263,
       "runtime_sec": 60
